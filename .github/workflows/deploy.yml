@@ -1,0 +1,288 @@
+# ============================================================
+## REQUIRED SETUP
+# ============================================================
+## Repository level (Settings > Secrets and variables > Actions), used by PR checks and build:
+#   Variable IMAGE_NAME      — (optional) GHCR path, defaults to <owner>/<repo>
+#   Secret   SONAR_TOKEN     — SonarCloud token
+#   Secret   GITLEAKS_LICENSE — required for repos owned by a GitHub organization
+#
+## "staging" environment (Settings > Environments > staging), used only by the deploy job:
+#   Variable DOKPLOY_API_BASE_URL   — e.g. http://dokploy.example.com:3000/api (include http:// or https://)
+#   Variable GHCR_USERNAME          — GitHub user that owns GHCR_PAT (Dokploy pulls with it)
+#   Variable APP_URL                — (optional) public URL that returns 2xx, used for a post-deploy
+#                                     health check (routes live under /v1, so use e.g. the Swagger URL)
+#   Secret   DOKPLOY_API_KEY        — Dokploy API key (Profile > API/CLI)
+#   Secret   DOKPLOY_APPLICATION_ID — Dokploy application ID of the staging app
+#   Secret   GHCR_PAT               — classic PAT with read:packages (Dokploy uses it to pull)
+# Environment values override repository values with the same name.
+#
+# Runtime environment (MONGODB_URL, JWT_*, REDIS_URL, AWS_*, CLOUDINARY_*, PORT, ...;
+# see .env.example) is NOT passed through this workflow. Set it in the Dokploy
+# application's Environment tab; Dokploy injects it when the container starts.
+# ============================================================
+
+# Flow:
+#   1. PR feature-x -> main opened/updated  => Gitleaks, Lint, SonarCloud (in parallel)
+#   2. PR approved and merged into main     => Build, Trivy, push to GHCR, deploy to Dokploy
+# Approval before merge is enforced by the branch protection rule on main,
+# not by this file. Direct pushes to main do not trigger a deploy.
+# ============================================================
+
+name: Build, Scan and Deploy
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, reopened, synchronize, closed]
+  # Manual redeploy from the Actions tab (select the main branch)
+  workflow_dispatch:
+
+concurrency:
+  # Deploy runs share one group and are never cancelled; PR check runs cancel superseded ones
+  group: ${{ github.workflow }}-${{ (github.event.action == 'closed' || github.event_name == 'workflow_dispatch') && 'deploy' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+
+permissions:
+  contents: read
+
+env:
+  # Defaults to owner/repo (e.g. jamfortetechnologies/veegil-cms-backend) when the variable is unset
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || github.repository }}
+  REGISTRY: ghcr.io
+  # Match the node:20-slim base and PNPM_VERSION in infra/Dockerfile
+  NODE_VERSION: 20
+  PNPM_VERSION: 10.28.2
+
+jobs:
+  # ------------------------------------------------------------
+  # JOB 1 — Scan for leaked secrets in git history (PR stage)
+  # ------------------------------------------------------------
+  gitleaks:
+    name: Gitleaks Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ------------------------------------------------------------
+  # JOB 2 — Lint (PR stage, runs in parallel with Gitleaks and SonarCloud)
+  # ------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Called directly rather than via `pnpm run lint`, whose --fix would hide fixable errors in CI
+      - name: Run ESLint
+        run: pnpm exec eslint "{src,apps,libs,test}/**/*.ts"
+
+  # ------------------------------------------------------------
+  # JOB 3 — SonarCloud static code analysis (PR stage, runs in parallel)
+  # ------------------------------------------------------------
+  sonarcloud-scan:
+    name: SonarCloud Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ------------------------------------------------------------
+  # JOB 4 — Build, Trivy scan, and push to GHCR (release stage:
+  #          PR merged into main, or manual run on main)
+  # ------------------------------------------------------------
+  build-scan-push-to-ghcr:
+    name: Build, Trivy Scan and Push
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'closed' &&
+       github.event.pull_request.merged == true) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.set_tag.outputs.image_tag }}
+      full_image: ${{ steps.set_tag.outputs.full_image }}
+    env:
+      # On a merged PR, build the merge commit that landed on main
+      RELEASE_SHA: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Set image tag
+        id: set_tag
+        run: |
+          IMAGE_TAG="${RELEASE_SHA::7}"
+          IMAGE_REPO="${REGISTRY}/${IMAGE_NAME,,}"
+          FULL_IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "full_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_REPO=$IMAGE_REPO" >> "$GITHUB_ENV"
+          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: |
+            PNPM_VERSION=${{ env.PNPM_VERSION }}
+          tags: |
+            ${{ env.FULL_IMAGE }}
+            ${{ env.IMAGE_REPO }}:latest
+          cache-from: type=gha
+          # ignore-error: a cache write that is rejected (read-only scope, race) must not fail the build
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Verify image architecture
+        run: |
+          ARCH=$(docker image inspect "$FULL_IMAGE" --format '{{.Architecture}}')
+          OS=$(docker image inspect "$FULL_IMAGE" --format '{{.Os}}')
+          echo "Architecture: $ARCH | OS: $OS"
+          [ "$ARCH" = "amd64" ] || { echo "Expected amd64"; exit 1; }
+          [ "$OS" = "linux" ]   || { echo "Expected linux"; exit 1; }
+
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ env.FULL_IMAGE }}
+          format: json
+          output: trivy-results.json
+          exit-code: 0
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+
+      - name: Show Trivy findings
+        run: |
+          jq '[.Results[]?.Vulnerabilities[]? | {pkg: .PkgName, version: .InstalledVersion, id: .VulnerabilityID, severity: .Severity}]' trivy-results.json
+
+      - name: Fail if vulnerabilities found
+        run: |
+          COUNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-results.json)
+          echo "Vulnerabilities found: $COUNT"
+          [ "$COUNT" -eq 0 ] || exit 1
+
+      - name: Push to GHCR
+        run: |
+          docker push "$FULL_IMAGE"
+          docker push "${IMAGE_REPO}:latest"
+
+      - name: Upload Trivy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.json
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------
+  # JOB 5 — Deploy to Dokploy (release stage, after a successful build)
+  # ------------------------------------------------------------
+  deploy:
+    name: Deploy to Dokploy
+    runs-on: ubuntu-latest
+    needs: build-scan-push-to-ghcr
+    # Binds this job to the "staging" GitHub environment: vars.* and secrets.* below
+    # resolve from it, and the run appears under Deployments > staging
+    environment:
+      name: staging
+      url: ${{ vars.APP_URL }}
+    env:
+      DOKPLOY_API_BASE_URL: ${{ vars.DOKPLOY_API_BASE_URL }}
+      FULL_IMAGE: ${{ needs.build-scan-push-to-ghcr.outputs.full_image }}
+      DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+      DOKPLOY_APPLICATION_ID: ${{ secrets.DOKPLOY_APPLICATION_ID }}
+      GHCR_USERNAME: ${{ vars.GHCR_USERNAME }}
+      GHCR_PAT: ${{ secrets.GHCR_PAT }}
+    steps:
+      - name: Check required settings
+        run: |
+          missing=0
+          for v in DOKPLOY_API_BASE_URL DOKPLOY_API_KEY DOKPLOY_APPLICATION_ID GHCR_USERNAME GHCR_PAT; do
+            if [ -z "${!v}" ]; then echo "::error::$v is not set (see REQUIRED SETUP at the top of this workflow)"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Update Dokploy image source
+        run: |
+          jq -n \
+            --arg id "$DOKPLOY_APPLICATION_ID" \
+            --arg image "$FULL_IMAGE" \
+            --arg user "$GHCR_USERNAME" \
+            --arg pass "$GHCR_PAT" \
+            '{applicationId: $id, dockerImage: $image, username: $user, password: $pass, registryUrl: "ghcr.io"}' \
+          | curl --fail-with-body -sS -X POST "${DOKPLOY_API_BASE_URL}/application.saveDockerProvider" \
+              -H "x-api-key: ${DOKPLOY_API_KEY}" \
+              -H "Content-Type: application/json" \
+              --data @-
+
+      - name: Trigger Dokploy deployment
+        run: |
+          jq -n --arg id "$DOKPLOY_APPLICATION_ID" '{applicationId: $id}' \
+          | curl --fail-with-body -sS -X POST "${DOKPLOY_API_BASE_URL}/application.deploy" \
+              -H "x-api-key: ${DOKPLOY_API_KEY}" \
+              -H "Content-Type: application/json" \
+              --data @-
+
+      - name: Health check
+        if: vars.APP_URL != ''
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          # Dokploy deploys asynchronously; poll for up to ~5 minutes
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null "$APP_URL"; then
+              echo "App is up"; exit 0
+            fi
+            echo "Waiting for app ($i/30)..."; sleep 10
+          done
+          echo "App did not become healthy"; exit 1
