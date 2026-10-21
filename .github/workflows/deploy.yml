@@ -1,6 +1,6 @@
 # ============================================================
 ## REQUIRED SETUP
-# ============================================================
+## ============================================================
 ## Repository level (Settings > Secrets and variables > Actions), used by PR checks and build:
 #   Variable IMAGE_NAME      — (optional) GHCR path, defaults to <owner>/<repo>
 #   Secret   SONAR_TOKEN     — SonarCloud token
